@@ -1,11 +1,11 @@
 set -x
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1 # For megatron communication/computation overlapping
-
-gsm8k_train_path=$HOME/data/gsm8k/train.parquet
-gsm8k_test_path=$HOME/data/gsm8k/test.parquet
-math_train_path=$HOME/data/math/train.parquet
-math_test_path=$HOME/data/math/test.parquet
+export RAY_DEDUP_LOGS=0 
+gsm8k_train_path=/mnt/public/daiyongxuan/data/gsm8k/train.parquet
+gsm8k_test_path=/mnt/public/daiyongxuan/data/gsm8k/test.parquet
+math_train_path=/mnt/public/daiyongxuan/data/math/train.parquet
+math_test_path=/mnt/public/daiyongxuan/data/math/test.parquet
 
 train_files="['$gsm8k_train_path', '$math_train_path']"
 test_files="['$gsm8k_test_path', '$math_test_path']"
@@ -19,7 +19,7 @@ python3 -m verl.trainer.main_ppo --config-path=./config --config-name='ppo_megat
     data.max_response_length=512 \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
-    actor_rollout_ref.model.path=Qwen/Qwen2-7B-Instruct \
+    actor_rollout_ref.model.path=/mnt/public/daiyongxuan/DeepSeek-R1-Distill-Qwen-1.5B \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.ppo_mini_batch_size=256 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 \
@@ -33,12 +33,12 @@ python3 -m verl.trainer.main_ppo --config-path=./config --config-name='ppo_megat
     actor_rollout_ref.ref.megatron.pipeline_model_parallel_size=2 \
     actor_rollout_ref.ref.megatron.tensor_model_parallel_size=2 \
     critic.optim.lr=1e-5 \
-    critic.model.path=Qwen/Qwen2-7B-Instruct \
+    critic.model.path=/mnt/public/daiyongxuan/DeepSeek-R1-Distill-Qwen-1.5B \
     critic.model.enable_gradient_checkpointing=False \
     critic.ppo_micro_batch_size_per_gpu=4 \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \
-    trainer.logger='["console","wandb"]' \
+    trainer.logger='console' \
     trainer.project_name='verl_ppo_gsm8k_math_examples' \
     trainer.experiment_name='qwen2_7b_megatron' \
     trainer.n_gpus_per_node=8 \

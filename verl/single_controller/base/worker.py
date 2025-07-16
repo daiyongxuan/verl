@@ -299,3 +299,11 @@ class Worker(WorkerHelper):
         """
         result = func(*args, **kwargs)
         return result
+
+    def print_role_info(self, role_keys):
+        try:
+            gpu_ids = ray.get_gpu_ids()
+            local_rank = gpu_ids[0] if gpu_ids else "N/A (CPU)"
+            print(f"[Worker Info] Local Rank: {local_rank} | Bound Roles: {role_keys}")
+        except Exception as e:
+            print(f"Error getting GPU IDs: {e}")

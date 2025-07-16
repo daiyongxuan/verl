@@ -15,6 +15,7 @@
 import inspect
 import logging
 import time
+import sys
 from copy import deepcopy
 from typing import Any, Optional
 
@@ -448,6 +449,12 @@ class RayWorkerGroup(WorkerGroup):
                     self._master_addr, self._master_port = rank_zero_info["MASTER_ADDR"], rank_zero_info["MASTER_PORT"]
                     # print(f"rank_zero_info: {rank_zero_info}")
                     # print(f"master_addr: {self._master_addr}, master_port: {self._master_port}")
+        print("[RayWorkerGroup] BroadCasting request to print worker info")
+        role_keys = list(self.ray_cls_with_init.class_dict.keys())
+        futures = [worker.print_role_info.remote(role_keys) for worker in self._workers]
+        ray.get(futures)
+        print("[RayWorkerGroup] All workers have reported their info")
+
 
     @property
     def worker_names(self):
@@ -793,6 +800,7 @@ def create_colocated_worker_cls(class_dict: dict[str, RayClassWithInitArgs]):
 
     remote_cls = ray.remote(WorkerDict)
     remote_cls = RayClassWithInitArgs(cls=remote_cls)
+    remote_cls.class_dict = class_dict
     return remote_cls
 
 
