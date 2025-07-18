@@ -5,7 +5,7 @@
 export CUDA_DEVICE_MAX_CONNECTIONS=1  # For megatron communication/computation overlapping
 export RAY_DEDUP_LOGS=0
 
-export CUDA_VISIBLE_DEVICES=0,1,2,3
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
 CONFIG_PATH="${CONFIG_PATH:-verl/trainer/config}"
 CONFIG_NAME="${CONFIG_NAME:-ppo_megatron_trainer}"
