@@ -575,7 +575,87 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         # clear kv cache
         get_torch_device().empty_cache()
         return output
+    
+    @register(dispatch_mode=Dispatch.RANK_ZERO)
+    def export_weights_for_aux_rollout(self):
+        from typing import Iterator, Tuple
+        import torch
+        assert self._is_rollout or self._is_actor
+        try:
+            if self._is_offload_param:
+                from verl.utils.megatron_utils import load_megatron_model_to_gpu
+                load_megatron_model_to_gpu(self.actor_module)
+            per_tensor_param: Iterator[Tuple[str, torch.Tensor]]
+            if self.bridge is not None:
+                per_tensor_param = self.bridge.export_weights(self.actor_module)
+            else:
+                # 此转化和上面 sharingManager 一致
+                from verl.utils.megatron_utils import per_tensor_generator
+                from verl.models.mcore import get_mcore_weight_converter
+                # 格式转换映射，左边是vllm的格式名称，右边是 Megatron 的格式名称
+                layer_name_mapping = {
+                    "qkv_layer_name": "self_attention.linear_qkv.",
+                    "gate_proj_layer_name": "linear_fc1.",
+                }
+                weight_converter = get_mcore_weight_converter(hf_config=self.actor_model_config, dtype=self.dtype)
+                per_tensor_param = per_tensor_generator(
+                    actor_module=self.actor_module,
+                    model_config=self.actor_model_config,
+                    weight_converter=weight_converter,
+                    transformer_config=self.tf_config,
+                    layer_name_mapping=layer_name_mapping
+                )
+            weight_dict = {}
+            for name, tensor in per_tensor_param:
+                name: str
+                tensor: torch.Tensor
+                weight_dict[name] = tensor.cpu().numpy() if hasattr(tensor, 'cpu') else tensor
+            if self._is_offload_param:
+                from verl.utils.megatron_utils import offload_megatron_model_to_cpu
+                offload_megatron_model_to_cpu(self.actor_module)
+            print(f"成功导出权重, 包含{len(weight_dict)}个Tensor")
+            return weight_dict
+        except Exception as e:
+            print(f"导出权重失败: {e}")
+            return None
+    
+    @register(dispatch_mode=Dispatch.RANK_ZERO)
+    def apply_weights_from_aux_rollout(self, weight_dict: dict) -> bool:
+        assert self._is_rollout, "只有Rollout 角色可以应用辅助权重"
+        try:
+            def weight_generator():
+                for name, numpy_tensor in weight_dict.items():
+                    if hasattr(numpy_tensor, 'dtype'):
+                        tensor = torch.from_numpy(numpy_tensor)
+                    else:
+                        tensor = numpy_tensor
+                    yield name, tensor
+            from verl.utils.vllm_utils import patch_vllm_moe_model_weight_loader
+            if self.sharding_manager is None:
+                raise RuntimeError("sharing manager 未初始化")
+            
+            if self.sharding_manager.model_runner is None:
+                raise RuntimeError("model runner 未初始化")
 
+            model = self.sharding_manager.model_runner.model
+            
+            if model is None:
+                raise RuntimeError("vLLM model 实例为空")
+
+            # 应用权重
+            patch_vllm_moe_model_weight_loader(model)
+            loaded_params = model.load_weights(weight_generator())
+            
+            print(f"成功应用权重到 vllm 模型, 加载了{len(loaded_params)}个参数")
+            get_torch_device().empty_cache()
+            
+            return True
+        
+        except Exception as e:
+            print(f"应用权重失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
     @register(dispatch_mode=Dispatch.MEGATRON_COMPUTE_PROTO)
     @GPUMemoryLogger(role="compute_ref_log_prob", logger=logger)
     @DistProfiler.annotate(color="olive")

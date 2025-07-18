@@ -358,6 +358,22 @@ class RayPPOTrainer:
         self.ray_worker_group_cls = ray_worker_group_cls
         self.device_name = device_name
         self.validation_generations_logger = ValidationGenerationsLogger()
+        
+        # 初始化 aux Rollout Manager
+        self.aux_rollout_manager = None
+        self._weights_updated = False # 权重更新标志位
+        if hasattr(config, 'aux_rollout') and config.aux_rollout.get('enable', False):
+            from verl.trainer.ppo.aux_rollout_client import AuxRolloutManager
+            
+            service_hosts = config.aux_rollout.get('service_hosts', [])
+            service_port = config.aux_rollout.get('service_port', 5555)
+            
+            if service_hosts:
+                self.aux_rollout_manager = AuxRolloutManager(service_hosts, service_port)
+                self._weights_updated = True
+                print(f"辅助推理服务已启用，连接到: {service_hosts}")
+            else:
+                print("警告: 辅助推理服务已启用但未配置服务主机")
 
         # if ref_in_actor is True, the reference policy will be actor without lora applied
         self.ref_in_actor = config.actor_rollout_ref.model.get("lora_rank", 0) > 0
@@ -1036,6 +1052,9 @@ class RayPPOTrainer:
         self.actor_rollout_wg.load_checkpoint(
             actor_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
         )
+        if self.aux_rollout_manager and self.aux_rollout_manager.is_available:
+            self._weights_updated = True # 检查点加载之后需要同步权重
+            print("检查点加载完成,将在下次推理之前更新权重")
         # load critic
         if self.use_critic:
             self.critic_wg.load_checkpoint(
@@ -1067,6 +1086,96 @@ class RayPPOTrainer:
             seqlen_list=global_seqlen_lst, partitions=global_partition_lst, prefix=logging_prefix
         )
         metrics.update(global_balance_stats)
+    
+    def _sync_weights_to_aux_rollouts(self):
+        """同步权重到辅助推理"""
+        from verl.workers.megatron_workers import ActorRolloutRefWorker
+        assert isinstance(self.actor_rollout_wg, ActorRolloutRefWorker), "actor_rollout_wg 必须为 ActorRolloutRefWorker 类型"
+        try:
+            weight_data = self.actor_rollout_wg.export_weights_for_aux_rollout()
+            success = self.aux_rollout_manager.update_weights(weight_dict=weight_data)
+            if success:
+                print(f"权重同步成功 (global_step: {self.global_steps})")
+            else:
+                print(f"权重同步失败 (global_step: {self.global_steps})")
+        except Exception as e:
+            print(f"权重同步过程中发生错误: {e}")
+    
+    def _generate_with_aux_rollout(self, gen_batch: DataProto) -> DataProto:
+        """使用主推理和辅助推理,并合并结果"""
+        if self._weights_updated and self.aux_rollout_manager and self.aux_rollout_manager.is_available:
+            print("检测到权重更新，正在同步权重到辅助推理服务")
+            try:
+                weight_data = self.actor_rollout_wg.export_weights_for_aux_rollout()
+                if weight_data is not None:
+                    success = self.aux_rollout_manager.update_weights(weight_data)
+                    if success:
+                        self._weights_updated = False  # 重置权重更新标志
+                        print("权重同步完成")
+                    else:
+                        print("权重同步失败，将使用主推理资源处理所有任务")
+                        return self.actor_rollout_wg.generate_sequences(gen_batch)
+                else:
+                    print("权重导出失败，将使用主推理资源处理所有任务")
+                    return self.actor_rollout_wg.generate_sequences(gen_batch)
+            except Exception as e:
+                print(f"权重同步过程中发生错误: {e}，将使用主推理资源处理所有任务")
+                return self.actor_rollout_wg.generate_sequences(gen_batch)
+        
+        batch_size = len(gen_batch)
+        
+        split_point = batch_size // 2
+        
+        gen_batch_main = gen_batch.select_idxs(list(range(split_point)))
+        gen_batch_aux = gen_batch.select_idxs(list(range(split_point, batch_size)))
+        
+        import threading
+        
+        main_result = [None]
+        aux_result = [None]
+        
+        def run_main_rollout():
+            main_result[0] = self.actor_rollout_wg.generate_sequences(gen_batch_main)
+        
+        def run_aux_rollout():
+            if self.aux_rollout_manager and self.aux_rollout_manager.is_available:
+                aux_result[0] = self.aux_rollout_manager.generate_sequences(gen_batch_aux)
+            else:
+                print("警告: 辅助推理服务不可用，将使用主推理资源处理所有任务")
+        
+        main_thread = threading.Thread(target=run_main_rollout)
+        aux_thread = threading.Thread(target=run_aux_rollout)
+        
+        main_thread.start()
+        aux_thread.start()
+        
+        main_thread.join()
+        aux_thread.join()
+        
+        # 合并两个 Rollout 的结果
+        if aux_result[0] is not None and len(aux_result[0]) > 0:
+            combined_results = DataProto.concat([main_result[0], aux_result[0]])
+            
+            main_timing = main_result[0].meta_info.get("timing", {})
+            aux_timing = aux_result[0].meta_info.get("timing", {})
+            # 取两个推理资源中较慢的时间作为总时间
+            combined_timing = {}
+            for key in main_timing:
+                if key in aux_timing:
+                    combined_timing[key] = max(main_timing[key], aux_timing[key])
+                else:
+                    combined_timing[key] = main_timing[key]
+            
+            combined_results.meta_info["timing"] = combined_timing
+            
+            return combined_results
+        else:
+            if aux_result[0] is None and split_point < batch_size:
+                main_result_aux = self.actor_rollout_wg.generate_sequences(gen_batch_aux)
+                combined_results = DataProto.concat([main_result[0], main_result_aux])
+                return combined_results
+            else:
+                return main_result[0]
 
     def fit(self):
         """
@@ -1162,7 +1271,10 @@ class RayPPOTrainer:
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
                         if not self.async_rollout_mode:
-                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                            if self.aux_rollout_manager and self.aux_rollout_manager.is_available:
+                                gen_batch_output = self._generate_with_aux_rollout(gen_batch)
+                            else:
+                                gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
                         else:
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
                         timing_raw.update(gen_batch_output.meta_info["timing"])
@@ -1317,6 +1429,8 @@ class RayPPOTrainer:
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
 
+                        if self.aux_rollout_manager and self.aux_rollout_manager.is_available:
+                            self._weights_updated = True
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
